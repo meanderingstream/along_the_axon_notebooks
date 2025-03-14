@@ -1,0 +1,184 @@
+# SmolVLM on Linux, with load model in a separate cell
+
+```elixir
+Mix.install([
+  {:pythonx, "~> 0.3.0"}
+])
+```
+
+## Background
+
+This notebook is a variation on the Samrat.me blog post by [Samrat Man Singh](https://samrat.me/running-ml-models-in-elixir-using-pythonx/).  This notebook was discussed in an AlongTheAxon.com blog post by [Scott Mueller](TBD)
+
+Samrat's code was specific to Mac computers because he used the MLX library for Macs.  This notebook was written and tested on a local Ubuntu server.  It should use about 6.33GB of VRAM on a GPU or 6.33GB of CPU memory without a GPU.
+
+## UV init
+
+Pythonx uses the UV package manager and the CPython implementation.  Please see the Pythonx documentation about the limitations when Elixir calls Python because of the Global Interpreter Lock (GIL).
+
+Below we are installing the required Python libraries without required versions.  Please see Samrat's blog post and Pythonx documentation for how to require a specific python library version. In this case, I wanted to show how Pythonx can install this most recent library version.  Essentially, this situation works like pip install <library_name>.  For those with more Python experience, the dependencies section is patterned after the Python requirements.txt contents.
+
+```elixir
+Pythonx.uv_init("""
+[project]
+name = "project"
+version = "0.0.0"
+requires-python = "==3.10.*"
+dependencies = [
+  "torch",
+  "transformers",
+  "pillow"
+]
+""")
+```
+
+## CUDA out of memory errors
+
+The current Pythonx examples show the first call to Pythonx.eval receives an empty Elixir map and returns a {result, global} tuple.  That approach can work for Python libraries that don't change  global Python state.  Samrat followed that pattern in his blog post, the first Pythonx.eval is passed an empty Elixir map and is used for the first set of global variables.
+
+The first notebook I built had more code that just loading the SmolVLM model.  I found that I needed to debug the Python code to see where things were failing.  Each time I made a modification to the python code, I re-ran the cell.  When re-running the cell, a new model is loaded onto the GPU without freeing the GPU VRAM from the first model load.  The dreaded CUDA out of memory issue.  Each time I did this, I had to close the notebook to free the GPU VRAM.
+
+<!-- livebook:{"break_markdown":true} -->
+
+There is another aspect to think about. In addition to the usual concept of Python data stored by name in global variables, a Python function that is used in another Pythonx.eval needs to be a Python global variable.
+
+<!-- livebook:{"break_markdown":true} -->
+
+```
+# WITH NEURAL NETWORK MODELS ON THE GPU, DON"T DO THIS
+{_, globals} = Pythonx.eval(
+  """
+  import torch
+  from PIL import Image
+  from transformers import AutoProcessor, AutoModelForVision2Seq
+  from transformers.image_utils import load_image
+
+  DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+  
+  # Initialize processor and model
+  processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-Instruct")
+  model = AutoModelForVision2Seq.from_pretrained(
+      "HuggingFaceTB/SmolVLM-Instruct",
+      torch_dtype=torch.bfloat16,
+  ).to(DEVICE)
+
+  """,
+  %{}
+)
+```
+
+## globals trick for reevaluating cells that load models in LiveBook
+
+By defining globals in a separate cell before the one that loads the model, we allow all of the cells to be reevaluatable.  The globals is passed in at the bottom of the cell and the new value is returned to the same, or different, Elixir name.  This is immutable Elixir so the original globals is gone and the name points to new data.  The old reference to the GPU VRAM is released and the model parameters are reloaded loaded on the GPU.  It avoids the CUDA out of memory that plagued my development of this notebook.  But it is time consuming to keep loading models onto the GPU.  Consider using a separate cell for just loading the model(s) onto the GPU.
+
+```elixir
+globals = %{}
+```
+
+```elixir
+{_, globals} = Pythonx.eval(
+  """
+  import torch
+  from PIL import Image
+  from transformers import AutoProcessor, AutoModelForVision2Seq
+  from transformers.image_utils import load_image
+
+  DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+  
+  # Initialize processor and model
+  processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-Instruct")
+  model = AutoModelForVision2Seq.from_pretrained(
+      "HuggingFaceTB/SmolVLM-Instruct",
+      torch_dtype=torch.bfloat16,
+  ).to(DEVICE)
+
+  """,
+  globals
+)
+```
+
+## bfloat16
+
+float16 or bfloat16 should be available on Nvidia 20xx and higher GPUs.  I don't know of any model degradation issues when running f16 or bf16.  If you have an NVidia GPU, always try to run at 16 bits instead of float32.  Huggingface's Accelerate has integrations with other GPU vendors, but I haven't verified whether this notebook will work with them.
+
+Also, I received some feedback from a PyTorch expert, in Pythonx use bfloat16.  The only reason to use float16 is for Google's Colab.  In Elixir, we aren't constrained by Colab.
+
+## Defining a Python function
+
+The eval defines a new Python function and recieves the current global variables.  The function is added to the global variable state and returned to Elixir
+
+```elixir
+# Pass in the existing global variables and return with the added variables
+{_, new_globals} = Pythonx.eval(
+  """
+  def describe_image(image_url):
+    messages = [
+      {
+          "role": "user",
+          "content": [
+              {"type": "image"},
+              {"type": "text", "text": "Can you describe the images?"}
+          ]
+      },
+    ]
+
+    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+    inputs = processor(text=prompt, images=[image_url], return_tensors="pt")
+    inputs = inputs.to(DEVICE)
+
+  
+
+    # Generate outputs
+    generated_ids = model.generate(**inputs, max_new_tokens=500)
+    generated_texts = processor.batch_decode(
+        generated_ids,
+        skip_special_tokens=True,
+    )
+    return generated_texts[0]
+  """,
+  # Passing the globals from the previous cell into this cell
+  globals
+)
+```
+
+The eval defines a new Python function and recieves the current global variables. The function is added to the global variable state and returned to Elixir
+
+<!-- livebook:{"break_markdown":true} -->
+
+The calls to describe_image do not add any new entries to the python global variables so we can ignore the returned globals
+
+```elixir
+{desc1, _unchanged_globals} = Pythonx.eval(
+  """
+  describe_image("https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg")
+  """,
+  new_globals
+)
+```
+
+```elixir
+description1 = Pythonx.decode(desc1)
+```
+
+I included these two cells just to show the describe_image function was added to the globals map
+
+```elixir
+Map.keys(globals)
+```
+
+```elixir
+Map.keys(new_globals)
+```
+
+```elixir
+{desc2, _unchanged_globals} = Pythonx.eval(
+  """
+  describe_image("http://images.cocodataset.org/test-stuff2017/000000000001.jpg")
+  """,
+  new_globals
+)
+```
+
+```elixir
+description2 = Pythonx.decode(desc2)
+```
